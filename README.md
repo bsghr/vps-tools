@@ -5,7 +5,7 @@
 在 VPS（root 用户）中执行以下命令：
 
 ```bash
-curl -sL [https://raw.githubusercontent.com/bsghr/vps-tools/refs/heads/main/xm.sh](https://raw.githubusercontent.com/bsghr/vps-tools/refs/heads/main/xm.sh) | bash
+curl -sL https://raw.githubusercontent.com/bsghr/vps-tools/main/xm.sh | bash
 ```
 
 ### 日常维护
