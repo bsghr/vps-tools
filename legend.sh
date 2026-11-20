@@ -91,6 +91,7 @@ gen_self_signed_cert() {
         -keyout "${HY_DIR}/key.pem" \
         -out "${HY_DIR}/cert.pem" \
         -subj "/CN=${SNI}" -days 3650 >/dev/null 2>&1
+    CERT_SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${HY_DIR}/cert.pem" | cut -d'=' -f2 | tr -d ': \r\n')
 }
 
 save_and_apply() {
@@ -103,6 +104,7 @@ PRIVATE_KEY="${PRIVATE_KEY}"
 PUBLIC_KEY="${PUBLIC_KEY}"
 SHORT_ID="${SHORT_ID}"
 HY_PASS="${HY_PASS}"
+CERT_SHA256="${CERT_SHA256}"
 EOF
 
     # 写入 Xray REALITY (TCP) 配置
@@ -239,6 +241,11 @@ show_info() {
     fi
     source "$ENV_FILE"
 
+    if [[ -z "$CERT_SHA256" && -f "${HY_DIR}/cert.pem" ]]; then
+        CERT_SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${HY_DIR}/cert.pem" | cut -d'=' -f2 | tr -d ': \r\n')
+        echo "CERT_SHA256=\"${CERT_SHA256}\"" >> "$ENV_FILE"
+    fi
+
     local ip formatted_ip
     ip=$(curl -s4m 5 https://api.ipify.org || curl -s4m 5 https://ifconfig.me || curl -s6m 5 https://api64.ipify.org)
     if [[ "$ip" == *":"* ]]; then
@@ -248,7 +255,7 @@ show_info() {
     fi
 
     local vless_link="vless://${UUID}@${formatted_ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#VLESS-REALITY"
-    local hy2_link="hysteria2://${HY_PASS}@${formatted_ip}:${PORT}/?sni=${SNI}&insecure=1#Hysteria2"
+    local hy2_link="hysteria2://${HY_PASS}@${formatted_ip}:${PORT}/?sni=${SNI}&pinSHA256=${CERT_SHA256}#Hysteria2"
 
     echo ""
     echo "============================================================"
@@ -261,7 +268,7 @@ show_info() {
     echo -e "  ${CYAN}[1] VLESS-REALITY 链接：${NC}"
     echo -e "  ${GREEN}${vless_link}${NC}"
     echo ""
-    echo -e "  ${CYAN}[2] Hysteria2 链接：${NC}"
+    echo -e "  ${CYAN}[2] Hysteria2 链接 (已启用证书指纹锁定)：${NC}"
     echo -e "  ${GREEN}${hy2_link}${NC}"
     echo "============================================================"
 }
