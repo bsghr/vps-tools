@@ -81,7 +81,6 @@ EOF
 load_env() {
     if [[ -f "$ENV_FILE" ]]; then
         source "$ENV_FILE"
-        # 兼容旧版单端口配置自动迁移
         if [[ -n "$PORT" && -z "$REALITY_ENABLED" && -z "$HY2_ENABLED" && -z "$SOCKS_ENABLED" ]]; then
             [[ -n "$UUID" ]] && REALITY_ENABLED="1" && REALITY_PORT="$PORT"
             [[ -n "$HY_PASS" ]] && HY2_ENABLED="1" && HY2_PORT="$PORT"
@@ -90,34 +89,92 @@ load_env() {
     fi
 }
 
+is_fw_active() {
+    [[ -z "$SOCKS_PORT" ]] && return 1
+    if command -v nft >/dev/null 2>&1 && nft list table inet legend_fw 2>/dev/null | grep -q "dport ${SOCKS_PORT} drop"; then
+        return 0
+    fi
+    if command -v iptables >/dev/null 2>&1 && iptables -L LEGEND_SOCKS -n 2>/dev/null | grep -q "dpt:${SOCKS_PORT}"; then
+        return 0
+    fi
+    return 1
+}
+
 apply_socks_fw() {
+    # 清理旧规则
+    command -v nft >/dev/null 2>&1 && nft delete table inet legend_fw 2>/dev/null || true
     if command -v iptables >/dev/null 2>&1; then
-        iptables -N LEGEND_SOCKS 2>/dev/null || iptables -F LEGEND_SOCKS
-        iptables -C INPUT -j LEGEND_SOCKS 2>/dev/null || iptables -I INPUT -j LEGEND_SOCKS
-        if [[ "$SOCKS_ENABLED" == "1" && -n "$RELAY_IP" && -n "$SOCKS_PORT" ]]; then
-            if [[ "$RELAY_IP" != *":"* ]]; then
-                iptables -A LEGEND_SOCKS -s "$RELAY_IP" -p tcp --dport "$SOCKS_PORT" -j ACCEPT
-                iptables -A LEGEND_SOCKS -s "$RELAY_IP" -p udp --dport "$SOCKS_PORT" -j ACCEPT
-            fi
-            iptables -A LEGEND_SOCKS -p tcp --dport "$SOCKS_PORT" -j DROP
-            iptables -A LEGEND_SOCKS -p udp --dport "$SOCKS_PORT" -j DROP
-        fi
+        iptables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
+        iptables -F LEGEND_SOCKS 2>/dev/null || true
+        iptables -X LEGEND_SOCKS 2>/dev/null || true
     fi
-
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -N LEGEND_SOCKS 2>/dev/null || ip6tables -F LEGEND_SOCKS
-        ip6tables -C INPUT -j LEGEND_SOCKS 2>/dev/null || ip6tables -I INPUT -j LEGEND_SOCKS
-        if [[ "$SOCKS_ENABLED" == "1" && -n "$RELAY_IP" && -n "$SOCKS_PORT" ]]; then
+        ip6tables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
+        ip6tables -F LEGEND_SOCKS 2>/dev/null || true
+        ip6tables -X LEGEND_SOCKS 2>/dev/null || true
+    fi
+
+    if [[ "$SOCKS_ENABLED" != "1" || -z "$RELAY_IP" || -z "$SOCKS_PORT" ]]; then
+        if [[ -f "$FW_SERVICE" ]]; then
+            systemctl disable legend-fw >/dev/null 2>&1
+            rm -f "$FW_SERVICE"
+            systemctl daemon-reload >/dev/null 2>&1
+        fi
+        return 0
+    fi
+
+    if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+        ensure_tool nftables
+        ! command -v nft >/dev/null 2>&1 && ensure_tool iptables
+    fi
+
+    local fw_ok=0
+
+    # 优先使用 nftables (同时拦截 IPv4 + IPv6，priority -10 最高优先级)
+    if command -v nft >/dev/null 2>&1; then
+        if nft add table inet legend_fw 2>/dev/null && \
+           nft 'add chain inet legend_fw input { type filter hook input priority -10; policy accept; }' 2>/dev/null; then
             if [[ "$RELAY_IP" == *":"* ]]; then
-                ip6tables -A LEGEND_SOCKS -s "$RELAY_IP" -p tcp --dport "$SOCKS_PORT" -j ACCEPT
-                ip6tables -A LEGEND_SOCKS -s "$RELAY_IP" -p udp --dport "$SOCKS_PORT" -j ACCEPT
+                nft add rule inet legend_fw input ip6 saddr "$RELAY_IP" tcp dport "$SOCKS_PORT" accept 2>/dev/null
+                nft add rule inet legend_fw input ip6 saddr "$RELAY_IP" udp dport "$SOCKS_PORT" accept 2>/dev/null
+            else
+                nft add rule inet legend_fw input ip saddr "$RELAY_IP" tcp dport "$SOCKS_PORT" accept 2>/dev/null
+                nft add rule inet legend_fw input ip saddr "$RELAY_IP" udp dport "$SOCKS_PORT" accept 2>/dev/null
             fi
-            ip6tables -A LEGEND_SOCKS -p tcp --dport "$SOCKS_PORT" -j DROP
-            ip6tables -A LEGEND_SOCKS -p udp --dport "$SOCKS_PORT" -j DROP
+            if nft add rule inet legend_fw input tcp dport "$SOCKS_PORT" drop 2>/dev/null && \
+               nft add rule inet legend_fw input udp dport "$SOCKS_PORT" drop 2>/dev/null; then
+                fw_ok=1
+            else
+                nft delete table inet legend_fw 2>/dev/null || true
+            fi
         fi
     fi
 
-    if [[ "$SOCKS_ENABLED" == "1" && -n "$RELAY_IP" ]]; then
+    # 回退使用 iptables + ip6tables
+    if [[ $fw_ok -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
+        if iptables -N LEGEND_SOCKS 2>/dev/null && iptables -I INPUT -j LEGEND_SOCKS 2>/dev/null; then
+            if [[ "$RELAY_IP" != *":"* ]]; then
+                iptables -A LEGEND_SOCKS -s "$RELAY_IP" -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
+                iptables -A LEGEND_SOCKS -s "$RELAY_IP" -p udp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
+            fi
+            if iptables -A LEGEND_SOCKS -p tcp --dport "$SOCKS_PORT" -j DROP 2>/dev/null && \
+               iptables -A LEGEND_SOCKS -p udp --dport "$SOCKS_PORT" -j DROP 2>/dev/null; then
+                fw_ok=1
+            fi
+        fi
+        if command -v ip6tables >/dev/null 2>&1; then
+            if ip6tables -N LEGEND_SOCKS 2>/dev/null && ip6tables -I INPUT -j LEGEND_SOCKS 2>/dev/null; then
+                if [[ "$RELAY_IP" == *":"* ]]; then
+                    ip6tables -A LEGEND_SOCKS -s "$RELAY_IP" -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
+                    ip6tables -A LEGEND_SOCKS -s "$RELAY_IP" -p udp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
+                fi
+                ip6tables -A LEGEND_SOCKS -p tcp --dport "$SOCKS_PORT" -j DROP 2>/dev/null
+                ip6tables -A LEGEND_SOCKS -p udp --dport "$SOCKS_PORT" -j DROP 2>/dev/null
+            fi
+        fi
+    fi
+
+    if [[ $fw_ok -eq 1 ]] && is_fw_active; then
         cat << EOF > "$FW_SERVICE"
 [Unit]
 Description=Legend SOCKS5 IP Whitelist
@@ -133,19 +190,17 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload >/dev/null 2>&1
         systemctl enable legend-fw >/dev/null 2>&1
+        echo -e "${GREEN}[OK] 防火墙白名单已生效：仅允许 ${RELAY_IP} 访问端口 ${SOCKS_PORT}。${NC}"
+        return 0
     else
-        if [[ -f "$FW_SERVICE" ]]; then
-            systemctl disable legend-fw >/dev/null 2>&1
-            rm -f "$FW_SERVICE"
-            systemctl daemon-reload >/dev/null 2>&1
-        fi
+        echo -e "${RED}[ERR] 防火墙规则加载失败（当前系统可能无 iptables/nftables 权限），请检查系统环境。${NC}"
+        return 1
     fi
 }
 
-# 支持开机自启静默加载防火墙白名单
 if [[ "$1" == "--apply-fw" ]]; then
     load_env
-    apply_socks_fw
+    apply_socks_fw >/dev/null 2>&1
     exit 0
 fi
 
@@ -483,7 +538,13 @@ show_info() {
 
     if [[ "$SOCKS_ENABLED" == "1" ]]; then
         local fw_desc="${YELLOW}未限制 (全网可连)${NC}"
-        [[ -n "$RELAY_IP" ]] && fw_desc="${GREEN}仅限 ${RELAY_IP} 访问${NC}"
+        if [[ -n "$RELAY_IP" ]]; then
+            if is_fw_active; then
+                fw_desc="${GREEN}已生效 (仅限 ${RELAY_IP} 访问)${NC}"
+            else
+                fw_desc="${RED}规则未生效 (请进入选项 3 -> 4 重新应用)${NC}"
+            fi
+        fi
         local socks_link="socks5://${SOCKS_USER}:${SOCKS_PASS}@${fmt_ip}:${SOCKS_PORT}#SOCKS5"
         echo -e "  ${CYAN}[SOCKS5 落地]${NC}    端口: ${SOCKS_PORT} | 访问限制: ${fw_desc}"
         echo "  用户名: ${SOCKS_USER}   密码: ${SOCKS_PASS}"
@@ -504,7 +565,7 @@ modify_menu() {
     [[ "$REALITY_ENABLED" == "1" ]] && echo "  1) 修改 VLESS-REALITY 端口 (当前: ${REALITY_PORT})"
     [[ "$HY2_ENABLED" == "1" ]]     && echo "  2) 修改 Hysteria2 端口     (当前: ${HY2_PORT})"
     [[ "$SOCKS_ENABLED" == "1" ]]   && echo "  3) 修改 SOCKS5 端口        (当前: ${SOCKS_PORT})"
-    [[ "$SOCKS_ENABLED" == "1" ]]   && echo "  4) 修改/清除 SOCKS5 允许的中转机 IP (当前: ${RELAY_IP:-不限制})"
+    [[ "$SOCKS_ENABLED" == "1" ]]   && echo "  4) 修改/重刷 SOCKS5 允许的中转机 IP (当前: ${RELAY_IP:-不限制})"
     echo "  0) 返回主菜单"
     read -rp "请选择: " m_choice
 
@@ -545,11 +606,15 @@ modify_menu() {
             ;;
         4)
             [[ "$SOCKS_ENABLED" != "1" ]] && return
-            read -rp "请输入允许访问的中转机 IP (直接回车表示取消限制): " new_ip
-            RELAY_IP=$(echo "$new_ip" | tr -d ' \r\n')
+            read -rp "请输入允许访问的中转机 IP (直接回车保留当前 [${RELAY_IP}]，输入 none 取消限制): " new_ip
+            new_ip=$(echo "$new_ip" | tr -d ' \r\n')
+            if [[ "$new_ip" == "none" ]]; then
+                RELAY_IP=""
+            elif [[ -n "$new_ip" ]]; then
+                RELAY_IP="$new_ip"
+            fi
             save_env
             apply_socks_fw
-            echo -e "${GREEN}SOCKS5 访问白名单已更新。${NC}"
             show_info
             ;;
         0) return ;;
@@ -633,15 +698,16 @@ uninstall_all() {
     rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
     systemctl daemon-reload >/dev/null 2>&1
 
+    command -v nft >/dev/null 2>&1 && nft delete table inet legend_fw 2>/dev/null || true
     if command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -j LEGEND_SOCKS 2>/dev/null
-        iptables -F LEGEND_SOCKS 2>/dev/null
-        iptables -X LEGEND_SOCKS 2>/dev/null
+        iptables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
+        iptables -F LEGEND_SOCKS 2>/dev/null || true
+        iptables -X LEGEND_SOCKS 2>/dev/null || true
     fi
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -D INPUT -j LEGEND_SOCKS 2>/dev/null
-        ip6tables -F LEGEND_SOCKS 2>/dev/null
-        ip6tables -X LEGEND_SOCKS 2>/dev/null
+        ip6tables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
+        ip6tables -F LEGEND_SOCKS 2>/dev/null || true
+        ip6tables -X LEGEND_SOCKS 2>/dev/null || true
     fi
 
     rm -f /usr/local/bin/xray /usr/local/bin/hysteria
