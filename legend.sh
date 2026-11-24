@@ -12,7 +12,6 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 HY_DIR="/usr/local/etc/hysteria"
 HY_CONFIG="${HY_DIR}/config.yaml"
 ENV_FILE="/usr/local/etc/xray/node.env"
-FW_SERVICE="/etc/systemd/system/legend-fw.service"
 SNI="aws.amazon.com"
 
 GREEN='\033[0;32m'
@@ -70,38 +69,19 @@ HY2_ENABLED="${HY2_ENABLED:-0}"
 HY2_PORT="${HY2_PORT}"
 HY_PASS="${HY_PASS}"
 CERT_SHA256="${CERT_SHA256}"
-SOCKS_ENABLED="${SOCKS_ENABLED:-0}"
-SOCKS_PORT="${SOCKS_PORT}"
-SOCKS_USER="${SOCKS_USER}"
-SOCKS_PASS="${SOCKS_PASS}"
-RELAY_IP="${RELAY_IP}"
+SS_ENABLED="${SS_ENABLED:-0}"
+SS_PORT="${SS_PORT}"
+SS_METHOD="${SS_METHOD}"
+SS_PASS="${SS_PASS}"
 EOF
 }
 
-load_env() {
-    if [[ -f "$ENV_FILE" ]]; then
-        source "$ENV_FILE"
-        if [[ -n "$PORT" && -z "$REALITY_ENABLED" && -z "$HY2_ENABLED" && -z "$SOCKS_ENABLED" ]]; then
-            [[ -n "$UUID" ]] && REALITY_ENABLED="1" && REALITY_PORT="$PORT"
-            [[ -n "$HY_PASS" ]] && HY2_ENABLED="1" && HY2_PORT="$PORT"
-            save_env
-        fi
-    fi
-}
+cleanup_legacy_socks() {
+    systemctl stop legend-fw >/dev/null 2>&1 || true
+    systemctl disable legend-fw >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/legend-fw.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
 
-is_fw_active() {
-    [[ -z "$SOCKS_PORT" ]] && return 1
-    if command -v nft >/dev/null 2>&1 && nft list table inet legend_fw 2>/dev/null | grep -q "dport ${SOCKS_PORT} drop"; then
-        return 0
-    fi
-    if command -v iptables >/dev/null 2>&1 && iptables -L LEGEND_SOCKS -n 2>/dev/null | grep -q "dpt:${SOCKS_PORT}"; then
-        return 0
-    fi
-    return 1
-}
-
-apply_socks_fw() {
-    # 清理旧规则
     command -v nft >/dev/null 2>&1 && nft delete table inet legend_fw 2>/dev/null || true
     if command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
@@ -113,96 +93,8 @@ apply_socks_fw() {
         ip6tables -F LEGEND_SOCKS 2>/dev/null || true
         ip6tables -X LEGEND_SOCKS 2>/dev/null || true
     fi
-
-    if [[ "$SOCKS_ENABLED" != "1" || -z "$RELAY_IP" || -z "$SOCKS_PORT" ]]; then
-        if [[ -f "$FW_SERVICE" ]]; then
-            systemctl disable legend-fw >/dev/null 2>&1
-            rm -f "$FW_SERVICE"
-            systemctl daemon-reload >/dev/null 2>&1
-        fi
-        return 0
-    fi
-
-    if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
-        ensure_tool nftables
-        ! command -v nft >/dev/null 2>&1 && ensure_tool iptables
-    fi
-
-    local fw_ok=0
-
-    # 优先使用 nftables (同时拦截 IPv4 + IPv6，priority -10 最高优先级)
-    if command -v nft >/dev/null 2>&1; then
-        if nft add table inet legend_fw 2>/dev/null && \
-           nft 'add chain inet legend_fw input { type filter hook input priority -10; policy accept; }' 2>/dev/null; then
-            if [[ "$RELAY_IP" == *":"* ]]; then
-                nft add rule inet legend_fw input ip6 saddr "$RELAY_IP" tcp dport "$SOCKS_PORT" accept 2>/dev/null
-                nft add rule inet legend_fw input ip6 saddr "$RELAY_IP" udp dport "$SOCKS_PORT" accept 2>/dev/null
-            else
-                nft add rule inet legend_fw input ip saddr "$RELAY_IP" tcp dport "$SOCKS_PORT" accept 2>/dev/null
-                nft add rule inet legend_fw input ip saddr "$RELAY_IP" udp dport "$SOCKS_PORT" accept 2>/dev/null
-            fi
-            if nft add rule inet legend_fw input tcp dport "$SOCKS_PORT" drop 2>/dev/null && \
-               nft add rule inet legend_fw input udp dport "$SOCKS_PORT" drop 2>/dev/null; then
-                fw_ok=1
-            else
-                nft delete table inet legend_fw 2>/dev/null || true
-            fi
-        fi
-    fi
-
-    # 回退使用 iptables + ip6tables
-    if [[ $fw_ok -eq 0 ]] && command -v iptables >/dev/null 2>&1; then
-        if iptables -N LEGEND_SOCKS 2>/dev/null && iptables -I INPUT -j LEGEND_SOCKS 2>/dev/null; then
-            if [[ "$RELAY_IP" != *":"* ]]; then
-                iptables -A LEGEND_SOCKS -s "$RELAY_IP" -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
-                iptables -A LEGEND_SOCKS -s "$RELAY_IP" -p udp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
-            fi
-            if iptables -A LEGEND_SOCKS -p tcp --dport "$SOCKS_PORT" -j DROP 2>/dev/null && \
-               iptables -A LEGEND_SOCKS -p udp --dport "$SOCKS_PORT" -j DROP 2>/dev/null; then
-                fw_ok=1
-            fi
-        fi
-        if command -v ip6tables >/dev/null 2>&1; then
-            if ip6tables -N LEGEND_SOCKS 2>/dev/null && ip6tables -I INPUT -j LEGEND_SOCKS 2>/dev/null; then
-                if [[ "$RELAY_IP" == *":"* ]]; then
-                    ip6tables -A LEGEND_SOCKS -s "$RELAY_IP" -p tcp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
-                    ip6tables -A LEGEND_SOCKS -s "$RELAY_IP" -p udp --dport "$SOCKS_PORT" -j ACCEPT 2>/dev/null
-                fi
-                ip6tables -A LEGEND_SOCKS -p tcp --dport "$SOCKS_PORT" -j DROP 2>/dev/null
-                ip6tables -A LEGEND_SOCKS -p udp --dport "$SOCKS_PORT" -j DROP 2>/dev/null
-            fi
-        fi
-    fi
-
-    if [[ $fw_ok -eq 1 ]] && is_fw_active; then
-        cat << EOF > "$FW_SERVICE"
-[Unit]
-Description=Legend SOCKS5 IP Whitelist
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/legend --apply-fw
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload >/dev/null 2>&1
-        systemctl enable legend-fw >/dev/null 2>&1
-        echo -e "${GREEN}[OK] 防火墙白名单已生效：仅允许 ${RELAY_IP} 访问端口 ${SOCKS_PORT}。${NC}"
-        return 0
-    else
-        echo -e "${RED}[ERR] 防火墙规则加载失败（当前系统可能无 iptables/nftables 权限），请检查系统环境。${NC}"
-        return 1
-    fi
+    unset SOCKS_ENABLED SOCKS_PORT SOCKS_USER SOCKS_PASS RELAY_IP
 }
-
-if [[ "$1" == "--apply-fw" ]]; then
-    load_env
-    apply_socks_fw >/dev/null 2>&1
-    exit 0
-fi
 
 install_xray_binary() {
     if ! command -v xray >/dev/null 2>&1; then
@@ -247,7 +139,7 @@ EOF
 }
 
 apply_xray_config() {
-    if [[ "$REALITY_ENABLED" != "1" && "$SOCKS_ENABLED" != "1" ]]; then
+    if [[ "$REALITY_ENABLED" != "1" && "$SS_ENABLED" != "1" ]]; then
         systemctl stop xray >/dev/null 2>&1
         systemctl disable xray >/dev/null 2>&1
         return 0
@@ -301,24 +193,16 @@ EOF
 )")
     fi
 
-    if [[ "$SOCKS_ENABLED" == "1" ]]; then
-        local ip_line=""
-        [[ -n "$SERVER_IP" ]] && ip_line=",
-        \"ip\": \"${SERVER_IP}\""
+    if [[ "$SS_ENABLED" == "1" ]]; then
         inbounds+=("$(cat << EOF
     {
       "listen": "0.0.0.0",
-      "port": ${SOCKS_PORT},
-      "protocol": "socks",
+      "port": ${SS_PORT},
+      "protocol": "shadowsocks",
       "settings": {
-        "auth": "password",
-        "accounts": [
-          {
-            "user": "${SOCKS_USER}",
-            "pass": "${SOCKS_PASS}"
-          }
-        ],
-        "udp": true${ip_line}
+        "method": "${SS_METHOD}",
+        "password": "${SS_PASS}",
+        "network": "tcp,udp"
       }
     }
 EOF
@@ -410,6 +294,29 @@ EOF
     fi
 }
 
+load_env() {
+    if [[ -f "$ENV_FILE" ]]; then
+        source "$ENV_FILE"
+        local need_save=0
+        local need_xray_reload=0
+
+        if [[ -n "$PORT" && -z "$REALITY_ENABLED" && -z "$HY2_ENABLED" && -z "$SS_ENABLED" ]]; then
+            [[ -n "$UUID" ]] && REALITY_ENABLED="1" && REALITY_PORT="$PORT"
+            [[ -n "$HY_PASS" ]] && HY2_ENABLED="1" && HY2_PORT="$PORT"
+            need_save=1
+        fi
+
+        if [[ "$SOCKS_ENABLED" == "1" || -f /etc/systemd/system/legend-fw.service ]]; then
+            cleanup_legacy_socks
+            need_save=1
+            need_xray_reload=1
+        fi
+
+        [[ $need_save -eq 1 ]] && save_env
+        [[ $need_xray_reload -eq 1 ]] && apply_xray_config >/dev/null 2>&1
+    fi
+}
+
 gen_reality_creds() {
     install_xray_binary
     UUID=$(xray uuid)
@@ -431,9 +338,13 @@ gen_hy2_creds() {
     HY_PASS=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
 }
 
-gen_socks_creds() {
-    SOCKS_USER="u$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
-    SOCKS_PASS=$(od -An -tx1 -N12 /dev/urandom | tr -d ' \n')
+gen_ss_creds() {
+    [[ -z "$SS_METHOD" ]] && SS_METHOD="2022-blake3-aes-128-gcm"
+    if [[ "$SS_METHOD" == "2022-blake3-aes-128-gcm" ]]; then
+        SS_PASS=$(head -c 16 /dev/urandom | base64 | tr -d '\r\n')
+    else
+        SS_PASS=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \r\n')
+    fi
 }
 
 install_menu() {
@@ -447,7 +358,7 @@ install_menu() {
     echo "=========================================================="
     echo "  1) VLESS-REALITY (TCP / 伪装 ${SNI})"
     echo "  2) Hysteria2     (UDP / 伪装 ${SNI})"
-    echo "  3) SOCKS5        (落地专用 + 中转机 IP 白名单)"
+    echo "  3) Shadowsocks   (TCP+UDP / SS-2022 或 AES-256-GCM)"
     echo "  0) 返回主菜单"
     echo "=========================================================="
     read -rp "请选择 [0-3]: " p_choice
@@ -479,19 +390,24 @@ install_menu() {
             apply_hy2_config && show_info
             ;;
         3)
-            local default_socks=$((RANDOM % 30000 + 20000))
-            read -rp "请输入 SOCKS5 监听端口 [默认随机 ${default_socks}]: " in_port
-            SOCKS_PORT=${in_port:-$default_socks}
-            if ! [[ "$SOCKS_PORT" =~ ^[0-9]+$ ]] || [ "$SOCKS_PORT" -lt 1 ] || [ "$SOCKS_PORT" -gt 65535 ]; then
+            local default_ss=$((RANDOM % 30000 + 20000))
+            read -rp "请输入 Shadowsocks 监听端口 [默认随机 ${default_ss}]: " in_port
+            SS_PORT=${in_port:-$default_ss}
+            if ! [[ "$SS_PORT" =~ ^[0-9]+$ ]] || [ "$SS_PORT" -lt 1 ] || [ "$SS_PORT" -gt 65535 ]; then
                 echo -e "${RED}端口号无效。${NC}"
                 return
             fi
-            read -rp "请输入允许访问的中转机 IP (留空则不限制来源): " in_relay
-            RELAY_IP=$(echo "$in_relay" | tr -d ' \r\n')
-            gen_socks_creds
-            SOCKS_ENABLED="1"
+            echo "  请选择加密方式："
+            echo "    1) 2022-blake3-aes-128-gcm [默认，最新 SS-2022 协议，性能极高]"
+            echo "    2) aes-256-gcm            [经典通用协议，无系统对时要求]"
+            read -rp "  请选择 [1-2，默认 1]: " m_opt
+            case "$m_opt" in
+                2) SS_METHOD="aes-256-gcm" ;;
+                *) SS_METHOD="2022-blake3-aes-128-gcm" ;;
+            esac
+            gen_ss_creds
+            SS_ENABLED="1"
             save_env
-            apply_socks_fw
             apply_xray_config && show_info
             ;;
         0) return ;;
@@ -501,7 +417,7 @@ install_menu() {
 
 show_info() {
     load_env
-    if [[ "$REALITY_ENABLED" != "1" && "$HY2_ENABLED" != "1" && "$SOCKS_ENABLED" != "1" ]]; then
+    if [[ "$REALITY_ENABLED" != "1" && "$HY2_ENABLED" != "1" && "$SS_ENABLED" != "1" ]]; then
         echo -e "${RED}当前尚未安装任何节点，请先执行选项 1 安装。${NC}"
         return
     fi
@@ -536,19 +452,13 @@ show_info() {
         echo "------------------------------------------------------------"
     fi
 
-    if [[ "$SOCKS_ENABLED" == "1" ]]; then
-        local fw_desc="${YELLOW}未限制 (全网可连)${NC}"
-        if [[ -n "$RELAY_IP" ]]; then
-            if is_fw_active; then
-                fw_desc="${GREEN}已生效 (仅限 ${RELAY_IP} 访问)${NC}"
-            else
-                fw_desc="${RED}规则未生效 (请进入选项 3 -> 4 重新应用)${NC}"
-            fi
-        fi
-        local socks_link="socks5://${SOCKS_USER}:${SOCKS_PASS}@${fmt_ip}:${SOCKS_PORT}#SOCKS5"
-        echo -e "  ${CYAN}[SOCKS5 落地]${NC}    端口: ${SOCKS_PORT} | 访问限制: ${fw_desc}"
-        echo "  用户名: ${SOCKS_USER}   密码: ${SOCKS_PASS}"
-        echo -e "  ${GREEN}${socks_link}${NC}"
+    if [[ "$SS_ENABLED" == "1" ]]; then
+        local ss_userinfo ss_link
+        ss_userinfo=$(printf "%s:%s" "${SS_METHOD}" "${SS_PASS}" | base64 | tr -d '\r\n=' | tr '+/' '-_')
+        ss_link="ss://${ss_userinfo}@${fmt_ip}:${SS_PORT}#Shadowsocks"
+        echo -e "  ${CYAN}[Shadowsocks]${NC}    端口: ${SS_PORT} (TCP+UDP) | 加密: ${SS_METHOD}"
+        echo "  密码: ${SS_PASS}"
+        echo -e "  ${GREEN}${ss_link}${NC}"
         echo "------------------------------------------------------------"
     fi
     echo "============================================================"
@@ -556,16 +466,15 @@ show_info() {
 
 modify_menu() {
     load_env
-    if [[ "$REALITY_ENABLED" != "1" && "$HY2_ENABLED" != "1" && "$SOCKS_ENABLED" != "1" ]]; then
+    if [[ "$REALITY_ENABLED" != "1" && "$HY2_ENABLED" != "1" && "$SS_ENABLED" != "1" ]]; then
         echo -e "${RED}当前尚未安装任何节点。${NC}"
         return
     fi
 
-    echo -e "\n${CYAN}=== 修改端口 / 中转IP白名单 ===${NC}"
+    echo -e "\n${CYAN}=== 修改节点端口 ===${NC}"
     [[ "$REALITY_ENABLED" == "1" ]] && echo "  1) 修改 VLESS-REALITY 端口 (当前: ${REALITY_PORT})"
     [[ "$HY2_ENABLED" == "1" ]]     && echo "  2) 修改 Hysteria2 端口     (当前: ${HY2_PORT})"
-    [[ "$SOCKS_ENABLED" == "1" ]]   && echo "  3) 修改 SOCKS5 端口        (当前: ${SOCKS_PORT})"
-    [[ "$SOCKS_ENABLED" == "1" ]]   && echo "  4) 修改/重刷 SOCKS5 允许的中转机 IP (当前: ${RELAY_IP:-不限制})"
+    [[ "$SS_ENABLED" == "1" ]]      && echo "  3) 修改 Shadowsocks 端口   (当前: ${SS_PORT})"
     echo "  0) 返回主菜单"
     read -rp "请选择: " m_choice
 
@@ -593,29 +502,15 @@ modify_menu() {
             fi
             ;;
         3)
-            [[ "$SOCKS_ENABLED" != "1" ]] && return
-            read -rp "请输入新的 SOCKS5 端口: " new_p
+            [[ "$SS_ENABLED" != "1" ]] && return
+            read -rp "请输入新的 Shadowsocks 端口: " new_p
             if [[ "$new_p" =~ ^[0-9]+$ ]] && [ "$new_p" -ge 1 ] && [ "$new_p" -le 65535 ]; then
-                SOCKS_PORT="$new_p"
+                SS_PORT="$new_p"
                 save_env
-                apply_socks_fw
                 apply_xray_config && show_info
             else
                 echo -e "${RED}端口号无效。${NC}"
             fi
-            ;;
-        4)
-            [[ "$SOCKS_ENABLED" != "1" ]] && return
-            read -rp "请输入允许访问的中转机 IP (直接回车保留当前 [${RELAY_IP}]，输入 none 取消限制): " new_ip
-            new_ip=$(echo "$new_ip" | tr -d ' \r\n')
-            if [[ "$new_ip" == "none" ]]; then
-                RELAY_IP=""
-            elif [[ -n "$new_ip" ]]; then
-                RELAY_IP="$new_ip"
-            fi
-            save_env
-            apply_socks_fw
-            show_info
             ;;
         0) return ;;
         *) echo -e "${RED}无效选项。${NC}" ;;
@@ -624,7 +519,7 @@ modify_menu() {
 
 reset_keys() {
     load_env
-    if [[ "$REALITY_ENABLED" != "1" && "$HY2_ENABLED" != "1" && "$SOCKS_ENABLED" != "1" ]]; then
+    if [[ "$REALITY_ENABLED" != "1" && "$HY2_ENABLED" != "1" && "$SS_ENABLED" != "1" ]]; then
         echo -e "${RED}当前尚未安装任何节点。${NC}"
         return
     fi
@@ -633,10 +528,10 @@ reset_keys() {
 
     [[ "$REALITY_ENABLED" == "1" ]] && gen_reality_creds
     [[ "$HY2_ENABLED" == "1" ]]     && gen_hy2_creds
-    [[ "$SOCKS_ENABLED" == "1" ]]   && gen_socks_creds
+    [[ "$SS_ENABLED" == "1" ]]      && gen_ss_creds
 
     save_env
-    [[ "$REALITY_ENABLED" == "1" || "$SOCKS_ENABLED" == "1" ]] && apply_xray_config
+    [[ "$REALITY_ENABLED" == "1" || "$SS_ENABLED" == "1" ]] && apply_xray_config
     [[ "$HY2_ENABLED" == "1" ]] && apply_hy2_config
     show_info
 }
@@ -677,7 +572,7 @@ update_kernels() {
     load_env
     ensure_tool curl
     echo -e "${CYAN}正在更新已安装的官方内核...${NC}"
-    if [[ "$REALITY_ENABLED" == "1" || "$SOCKS_ENABLED" == "1" ]]; then
+    if [[ "$REALITY_ENABLED" == "1" || "$SS_ENABLED" == "1" ]]; then
         bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
         systemctl restart xray
         echo -e "${GREEN}Xray      : $(xray version | head -n 1)${NC}"
@@ -689,32 +584,22 @@ update_kernels() {
 }
 
 uninstall_all() {
-    read -rp "确认彻底卸载所有节点内核、配置、防火墙白名单及 legend 脚本？(y/N): " confirm
+    read -rp "确认彻底卸载所有节点内核、配置及 legend 脚本？(y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
-    systemctl stop xray hysteria legend-fw >/dev/null 2>&1
-    systemctl disable xray hysteria legend-fw >/dev/null 2>&1
-    rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service /etc/systemd/system/hysteria.service "$FW_SERVICE"
+    systemctl stop xray hysteria >/dev/null 2>&1
+    systemctl disable xray hysteria >/dev/null 2>&1
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service /etc/systemd/system/hysteria.service
     rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
     systemctl daemon-reload >/dev/null 2>&1
 
-    command -v nft >/dev/null 2>&1 && nft delete table inet legend_fw 2>/dev/null || true
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
-        iptables -F LEGEND_SOCKS 2>/dev/null || true
-        iptables -X LEGEND_SOCKS 2>/dev/null || true
-    fi
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -D INPUT -j LEGEND_SOCKS 2>/dev/null || true
-        ip6tables -F LEGEND_SOCKS 2>/dev/null || true
-        ip6tables -X LEGEND_SOCKS 2>/dev/null || true
-    fi
+    cleanup_legacy_socks
 
     rm -f /usr/local/bin/xray /usr/local/bin/hysteria
     rm -rf /usr/local/etc/xray /usr/local/etc/hysteria /usr/local/share/xray /var/log/xray
     rm -f /usr/local/bin/legend
 
-    echo -e "${GREEN}已本地彻底清理卸载，VPS 中无任何节点或防火墙残留。${NC}"
+    echo -e "${GREEN}已本地彻底清理卸载，VPS 中无任何节点残留。${NC}"
     exit 0
 }
 
@@ -735,19 +620,19 @@ while true; do
         H_STAT="${GRAY}未安装${NC}"
     fi
 
-    if [[ "$SOCKS_ENABLED" == "1" ]]; then
-        systemctl is-active --quiet xray 2>/dev/null && S_STAT="${GREEN}运行中${NC}" || S_STAT="${RED}已停止${NC}"
+    if [[ "$SS_ENABLED" == "1" ]]; then
+        systemctl is-active --quiet xray 2>/dev/null && SS_STAT="${GREEN}运行中${NC}" || SS_STAT="${RED}已停止${NC}"
     else
-        S_STAT="${GRAY}未安装${NC}"
+        SS_STAT="${GRAY}未安装${NC}"
     fi
 
     echo ""
     echo "================================================================"
-    echo -e "  Legend 极简面板  [REALITY:${R_STAT} | HY2:${H_STAT} | SOCKS5:${S_STAT}]"
+    echo -e "  Legend 极简面板  [REALITY:${R_STAT} | HY2:${H_STAT} | SS:${SS_STAT}]"
     echo "================================================================"
-    echo "  1. 安装 / 部署节点 (可选 REALITY / HY2 / SOCKS5)"
+    echo "  1. 安装 / 部署节点 (REALITY / HY2 / Shadowsocks)"
     echo "  2. 查看已部署节点信息与导入链接"
-    echo "  3. 修改端口 / SOCKS5 中转IP白名单"
+    echo "  3. 修改节点端口"
     echo "  4. 重置密钥 / 密码 / 证书"
     echo "  5. 服务管理 (重启 / 停止 / 日志)"
     echo "  6. 更新已安装的官方内核"
