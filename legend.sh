@@ -339,8 +339,10 @@ gen_hy2_creds() {
 }
 
 gen_ss_creds() {
-    [[ -z "$SS_METHOD" ]] && SS_METHOD="2022-blake3-aes-128-gcm"
-    if [[ "$SS_METHOD" == "2022-blake3-aes-128-gcm" ]]; then
+    [[ -z "$SS_METHOD" ]] && SS_METHOD="2022-blake3-aes-256-gcm"
+    if [[ "$SS_METHOD" == "2022-blake3-aes-256-gcm" ]]; then
+        SS_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
+    elif [[ "$SS_METHOD" == "2022-blake3-aes-128-gcm" ]]; then
         SS_PASS=$(head -c 16 /dev/urandom | base64 | tr -d '\r\n')
     else
         SS_PASS=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \r\n')
@@ -358,7 +360,7 @@ install_menu() {
     echo "=========================================================="
     echo "  1) VLESS-REALITY (TCP / 伪装 ${SNI})"
     echo "  2) Hysteria2     (UDP / 伪装 ${SNI})"
-    echo "  3) Shadowsocks   (TCP+UDP / SS-2022 或 AES-256-GCM)"
+    echo "  3) Shadowsocks   (TCP+UDP / SS-2022 256-GCM 或 AES-256-GCM)"
     echo "  0) 返回主菜单"
     echo "=========================================================="
     read -rp "请选择 [0-3]: " p_choice
@@ -398,12 +400,12 @@ install_menu() {
                 return
             fi
             echo "  请选择加密方式："
-            echo "    1) 2022-blake3-aes-128-gcm [默认，最新 SS-2022 协议，性能极高]"
+            echo "    1) 2022-blake3-aes-256-gcm [默认，最新 SS-2022 256位高强度加密]"
             echo "    2) aes-256-gcm            [经典通用协议，无系统对时要求]"
             read -rp "  请选择 [1-2，默认 1]: " m_opt
             case "$m_opt" in
                 2) SS_METHOD="aes-256-gcm" ;;
-                *) SS_METHOD="2022-blake3-aes-128-gcm" ;;
+                *) SS_METHOD="2022-blake3-aes-256-gcm" ;;
             esac
             gen_ss_creds
             SS_ENABLED="1"
